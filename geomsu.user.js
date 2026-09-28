@@ -1,8 +1,8 @@
 ﻿// ==UserScript==
 // @name         스타일씨 체험단 검수 자동화
 // @namespace    maison-once-a-year
-// @version      39.0
-// @description  [v39] 대량 등록 대비 보완: 반려 비율상한이 소규모 캠페인 오작동 수정(반려 5건 미만이면 상한 미적용) · 캠페인 타임아웃 15→30분 · 이미지 축소 GM_xmlhttpRequest용 @connect 선언. v38 기능 유지.
+// @version      41.0
+// @description  [v41.0] IP차단 방지 안전판 — 접근차단/에러 감지 시 자동 즉시중단, 요청 간격 상향(수집 2.5s·캠페인이동 4s), 페이지네이션 상한(50p). v40.2 재검수 + v40.1 취소요청 일괄승인 + v40 영구원장/백업 유지.
 // @match        *://*.stylec.co.kr/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -33,8 +33,10 @@
   const _확인 = window.confirm.bind(window);
   const _프롬 = window.prompt.bind(window);
   let _사이트마지막알림 = null;   // [v37] 사이트가 띄우려던 알림(반려 서버에러 등)을 캡처 → 반려 성공/실패 정직 판정
+  let 차단됨 = false;   // [v41] IP차단/접근불가 감지 시 모든 자동화 즉시 정지
+  const 차단문구 = /(접근\s*불가|비정상적?인?\s*접근|접근이?\s*(제한|차단)됨?|일시적으로\s*(제한|차단)|too\s*many\s*requests|forbidden|\b403\b|\b429\b|\b503\b)/i;
   const 알림무력화 = () => {
-    const 무시알림 = function (m) { try { _사이트마지막알림 = { t: Date.now(), m: String(m) }; console.log('⚠ 사이트 알림 무시: ' + m); } catch (e) {} };
+    const 무시알림 = function (m) { try { _사이트마지막알림 = { t: Date.now(), m: String(m) }; console.log('⚠ 사이트 알림 무시: ' + m); if (차단문구.test(String(m)) && typeof 차단걸림 === 'function') 차단걸림('사이트 알림: ' + String(m).slice(0, 120)); } catch (e) {} };
     const 자동확인 = function (m) { try { console.log('⚠ 사이트 확인 자동통과: ' + m); } catch (e) {} return true; };
     const 자동프롬 = function (m, d) { try { console.log('⚠ 사이트 프롬프트 자동: ' + m); } catch (e) {} return d != null ? d : ''; };
     for (const w of [_페이지창, window]) {
@@ -83,6 +85,76 @@
   const 수집키 = 'juksu_collect_v17';
   const 수집읽기 = () => { try { return JSON.parse(G.get(수집키, '')) || { active: false, codes: [] }; } catch (e) { return { active: false, codes: [] }; } };
   const 수집쓰기 = o => G.set(수집키, JSON.stringify(o));
+
+  /* ═════════ [v40] 주문번호 영구 원장 (독립 저장 — 누적 초기화와 완전 분리) ═════════ */
+  // 구조: { "주문번호(숫자만)": { 캠, 이름, 번호, 주문일, 검수일, 판정 } }
+  // 최초 등록된 주문번호가 '원본'. 이후 다른 캠페인이 같은 번호를 쓰면 = 돌려쓰기 → 반려.
+  const 원장키 = 'juksu_ledger_v40';
+  const 시드키 = 'juksu_ledger_seeded_v40';
+  const 원장읽기 = () => { try { return JSON.parse(G.get(원장키, '{}')) || {}; } catch (e) { return {}; } };
+  const 원장쓰기 = o => G.set(원장키, JSON.stringify(o));
+  // 최초 1회: 과거 검수 누적(juksu_accum)의 주문번호를 영구 원장으로 흡수 → 과거분도 커버
+  const 원장시드 = () => {
+    try {
+      if (G.get(시드키, '') === '1') return;
+      const L = 원장읽기(); const acc = 누적읽기(); let n = 0;
+      Object.keys(acc).forEach(ck => {
+        const 캠id = (String(ck).match(/A\d{6}/) || [ck])[0];
+        (acc[ck].행 || []).forEach(r => {
+          const 검수일 = acc[ck].날짜 || '';
+          [숫자만(r[6]), 숫자만(r[7])].forEach(on => {
+            if (on && on.length >= 8 && !L[on]) { L[on] = { 캠: 캠id, 이름: r[1] || '', 번호: r[0] || '', 주문일: r[12] || '', 검수일: 검수일, 판정: r[3] || '' }; n++; }
+          });
+        });
+      });
+      원장쓰기(L); G.set(시드키, '1');
+      console.log('🌱 주문번호 영구 원장 시드 완료 — 과거 누적에서 ' + n + '개 흡수 (총 ' + Object.keys(L).length + '개)');
+    } catch (e) { console.log('원장 시드 오류: ' + e); }
+  };
+  // 조회: 이 건의 제출/영수증 번호가 '다른 캠페인'에 이미 등록돼 있으면 그 원본 표시를 반환(같은 캠페인은 제외)
+  const 원장크로스조회 = (d, 현재캠) => {
+    const L = 원장읽기(); const 현재id = (String(현재캠).match(/A\d{6}/) || [현재캠])[0];
+    const c = [숫자만(d.주문번호)]; if (d.판독 && d.판독.영수증주문번호) c.push(숫자만(d.판독.영수증주문번호));
+    for (const on of c) { if (on && on.length >= 8 && L[on] && L[on].캠 && L[on].캠 !== 현재id) { const e = L[on]; return e.캠 + '·' + (e.이름 || '') + (e.검수일 ? '·' + e.검수일 : ''); } }
+    return '';
+  };
+  // 등록: 이 건의 번호를 영구 원장에 기록(최초 등록 우선 — 이미 있으면 덮어쓰지 않음)
+  const 원장등록 = (d, 캠, 검수일) => {
+    const L = 원장읽기(); const 캠id = (String(캠).match(/A\d{6}/) || [캠])[0]; let 변동 = false;
+    const c = [숫자만(d.주문번호)]; if (d.판독 && d.판독.영수증주문번호) c.push(숫자만(d.판독.영수증주문번호));
+    [...new Set(c)].forEach(on => {
+      if (on && on.length >= 8 && !L[on]) { L[on] = { 캠: 캠id, 이름: d.이름 || '', 번호: d.번호 || '', 주문일: (d.판독 && d.판독.주문일) || '', 검수일: 검수일 || '', 판정: d.판정 || '' }; 변동 = true; }
+    });
+    if (변동) 원장쓰기(L);
+  };
+  // 백업 파일 내보내기 (JSON) — 진짜 '영구'의 핵심: 브라우저/PC 소실 대비
+  function 원장백업() {
+    const L = 원장읽기(); const n = Object.keys(L).length;
+    const b = new Blob([JSON.stringify({ _종류: 'maison_order_ledger', _버전: 40, _생성: new Date().toISOString(), 건수: n, 원장: L }, null, 0)], { type: 'application/json;charset=utf-8' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = '주문번호원장_백업_' + 스탬프오늘() + '.json';
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    _알림('주문번호 원장 백업 완료\n\n총 ' + n + '개 주문번호\n파일: 주문번호원장_백업_' + 스탬프오늘() + '.json\n\n이 파일을 안전한 곳(드라이브 등)에 보관하세요.');
+  }
+  // 백업 파일 가져오기(복원) — 기존 원장과 합침(기존 우선, 없는 것만 추가)
+  function 원장복원() {
+    const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.json,application/json';
+    inp.onchange = () => {
+      const f = inp.files && inp.files[0]; if (!f) return;
+      const rd = new FileReader();
+      rd.onload = () => {
+        try {
+          const j = JSON.parse(rd.result); const src = (j && j.원장) ? j.원장 : j;
+          if (!src || typeof src !== 'object') { _알림('원장 형식이 아닙니다.'); return; }
+          const L = 원장읽기(); let 추가 = 0, 기존 = 0;
+          Object.keys(src).forEach(on => { if (!L[on]) { L[on] = src[on]; 추가++; } else 기존++; });
+          원장쓰기(L); G.set(시드키, '1'); 버튼갱신();
+          _알림('원장 복원 완료\n\n새로 추가 ' + 추가 + '개 / 이미 있던 것 ' + 기존 + '개\n현재 총 ' + Object.keys(L).length + '개');
+        } catch (e) { _알림('복원 실패: ' + String(e.message || e).slice(0, 80)); }
+      };
+      rd.readAsText(f);
+    };
+    inp.click();
+  }
   const URL페이지 = () => Number(new URLSearchParams(location.search).get('page') || 1);
   // [v18] 주소 재인코딩으로 한글 필터가 깨지지 않게 page= 숫자만 문자열 치환
   const 페이지이동 = n => {
@@ -111,8 +183,11 @@
   if (typeof GM_registerMenuCommand === 'function') {
     GM_registerMenuCommand('▶ 전체 자동검수 시작(목록에서)', () => 자동시작());
     GM_registerMenuCommand('🔍 이 캠페인만 검수', () => 검수실행());
+    GM_registerMenuCommand('🚫 취소요청 일괄승인(이 캠페인)', () => 취소요청일괄승인());
     GM_registerMenuCommand('📦 전체 내보내기', () => 전체내보내기());
     GM_registerMenuCommand('⏹ 자동검수 중지', () => 자동중지());
+    GM_registerMenuCommand('💾 주문번호 원장 백업(내보내기)', () => 원장백업());
+    GM_registerMenuCommand('📥 주문번호 원장 복원(가져오기)', () => 원장복원());
     GM_registerMenuCommand('🗑 누적 초기화', () => 누적초기화());
     GM_registerMenuCommand('🔑 API 키 변경', () => { const k = prompt('새 API 키', G.get(키이름, '')); if (k !== null) { G.set(키이름, k.trim()); _알림('저장됨'); } });
   }
@@ -129,7 +204,10 @@
     const pg = document.createElement('div'); pg.id = '__진행줄'; pg.style.cssText = 'font-size:12px;color:#fff;background:rgba(0,90,160,.9);padding:4px 10px;border-radius:8px;display:none'; box.appendChild(pg);
     if (isList) box.appendChild(mk('__시작버튼', '▶ 전체 자동검수 시작', '#0b5cad', () => 자동시작()));
     if (isDetail) box.appendChild(mk('__검수버튼', '🔍 이 캠페인만 검수', '#111', () => 검수실행()));
+    if (isDetail) box.appendChild(mk('__취소승인버튼', '🚫 취소요청 일괄승인', '#c2410c', () => 취소요청일괄승인()));
     box.appendChild(mk('__내보내기버튼', '📦 전체 내보내기', '#1a7f45', () => 전체내보내기()));
+    box.appendChild(mk('__원장백업버튼', '💾 주문번호 원장 백업', '#5b3fa0', () => 원장백업()));
+    box.appendChild(mk('__원장복원버튼', '📥 원장 복원(가져오기)', '#3f5aa0', () => 원장복원()));
     box.appendChild(mk('__중지버튼', '⏹ 자동 중지', '#8a3b3b', () => 자동중지()));
     document.body.appendChild(box);
     버튼갱신();
@@ -138,6 +216,7 @@
   const 버튼갱신 = () => {
     const n = Object.keys(누적읽기()).length;
     const eb = document.getElementById('__내보내기버튼'); if (eb) eb.textContent = '📦 전체 내보내기 (' + n + ')';
+    const lb = document.getElementById('__원장백업버튼'); if (lb) { try { lb.textContent = '💾 주문번호 원장 백업 (' + Object.keys(원장읽기()).length + ')'; } catch (e) {} }
     const o = 오케읽기(); const st = document.getElementById('__상태줄');
     if (st) {
       if (o.mode === 'running') { st.style.display = 'block'; st.textContent = '⏳ 자동검수 ' + (o.idx + 1) + ' / ' + o.queue.length; }
@@ -145,7 +224,7 @@
       else st.style.display = 'none';
     }
   };
-  const 준비 = () => { if (document.body) 패널만들기(); else return setTimeout(준비, 500); 자동진행체크(); 수집진행체크(); };
+  const 준비 = () => { if (document.body) 패널만들기(); else return setTimeout(준비, 500); try { 원장시드(); } catch (e) {} 자동진행체크(); 수집진행체크(); };
 
   /* ═════════ 내보내기 / 초기화 ═════════ */
   function 전체내보내기() {
@@ -177,6 +256,61 @@
   function 누적초기화() { const n = Object.keys(누적읽기()).length; if (!_확인('누적 ' + n + '개 결과 + 문제 기록을 모두 지울까요? (내보내기 먼저 했는지 확인)')) return; 누적쓰기({}); 문제비우기(); 버튼갱신(); _알림('초기화 완료'); }
   function 자동중지() { const o = 오케읽기(); o.mode = 'idle'; 오케쓰기(o); 수집쓰기({ active: false, codes: [], allcodes: [] }); 버튼갱신(); _알림('자동검수를 중지했습니다. (누적 결과는 유지)'); }
 
+  /* ═════════ [v40.1] 취소요청 일괄승인 (이 캠페인) ═════════ */
+  // 캠페인 상세에서 '선정 취소 요청' 버튼 → 모달의 '선정취소 승인' 클릭. 취소는 페이백 미지급이라 현금 손실 없음.
+  let 취소처리중 = false;
+  async function 취소요청일괄승인() {
+    if (취소처리중) { _알림('이미 취소요청 처리 중입니다.'); return; }
+    if (!isDetail) { _알림('캠페인 상세 페이지에서 실행하세요.\n(체험단 관리 → 취소요청 탭 → 캠페인 진입 후 이 버튼)'); return; }
+    // 화면에 취소요청 버튼이 있는지 먼저 확인
+    const 요청버튼찾기 = () => [...document.querySelectorAll('button,a,[role=button],span,div')]
+      .find(e => e.offsetParent !== null && /^선정\s*취소\s*요청$/.test((e.textContent || '').trim()) && (e.textContent || '').replace(/\s/g, '').length <= 8);
+    if (!요청버튼찾기()) { _알림('이 캠페인에 처리할 취소요청이 없습니다.\n(선정자 목록 맨 아래까지 스크롤한 뒤 다시 눌러보세요)'); return; }
+    if (!_확인('이 캠페인의 선정취소 요청을 모두 [선정취소 승인] 처리합니다.\n\n· 취소는 본인이 신청 + 페이백 미지급이라 현금 손실이 없습니다.\n· 처리한 사람·사유는 파일로 저장됩니다.\n\n계속할까요?')) return;
+
+    취소처리중 = true;
+    const btn = document.getElementById('__취소승인버튼'); if (btn) { btn.disabled = true; btn.textContent = '⏳ 취소요청 처리 중…'; }
+    const 로그 = []; let 처리 = 0, 실패 = 0;
+    try {
+      for (let guard = 0; guard < 60; guard++) {
+        // 남은 취소요청 버튼까지 스크롤하며 탐색
+        const trig = 요청버튼찾기();
+        if (!trig) break;
+        try { trig.scrollIntoView({ block: 'center' }); } catch (e) {}
+        await sleep(400);
+        trig.click(); await sleep(1300);   // 모달 열림
+        // 모달에서 이름·사유 수집
+        const 모달문 = document.body.innerText;
+        const 이름 = (모달문.match(/([가-힣]{2,4})\s*님?\s*께서/) || [])[1] || (모달문.match(/([가-힣]{2,4})\s*님/) || [])[1] || '?';
+        const 사유 = ((모달문.match(/이유로[\s\S]{0,40}?\n([^\n]{2,80})/) || [])[1] || '').trim();
+        // 주황 '선정취소 승인' 버튼 대기 후 클릭 ('취소 거절'은 절대 누르지 않음)
+        const 승인 = await 대기찾기(() => [...document.querySelectorAll('button,a,[role=button]')]
+          .find(e => e.offsetParent !== null && /선정취소\s*승인|선정\s*취소\s*승인/.test((e.textContent || '').replace(/\s+/g, ' ')) && !/거절/.test(e.textContent || '')), 14, 500);
+        if (!승인) {
+          실패++; 로그.push([이름, '실패', '승인버튼 못찾음', 사유].join('\t'));
+          // 모달 닫고 중단(무한루프 방지 — 같은 버튼이 계속 잡히면 위험)
+          const x = V('×')[0]; if (x && x.offsetParent) x.click(); await sleep(800);
+          break;
+        }
+        승인.click(); await sleep(1900);
+        처리++; 로그.push([이름, '승인', '', 사유].join('\t'));
+        console.log('🚫 취소승인: ' + 이름 + (사유 ? ' — ' + 사유 : ''));
+        // 잔여 모달 정리
+        const x = V('×')[0]; if (x && x.offsetParent) x.click(); await sleep(700);
+      }
+    } catch (e) { console.error(e); 로그.push(['-', '오류', String(e).slice(0, 60), ''].join('\t')); }
+    finally {
+      취소처리중 = false; if (btn) { btn.disabled = false; btn.textContent = '🚫 취소요청 일괄승인'; }
+    }
+    // 처리 내역 파일 저장
+    if (로그.length) {
+      const 캠 = (document.body.innerText.match(/(\d{16}A\d{6})/) || [''])[0];
+      다운로드('취소요청_처리내역_' + (캠 || '캠페인') + '_' + 스탬프오늘() + '.tsv',
+        ['이름\t결과\t비고\t사유'].concat(로그).join('\n'));
+    }
+    _알림('취소요청 처리 완료\n\n승인 ' + 처리 + '건 / 실패 ' + 실패 + '건\n\n처리 내역이 파일로 저장됐습니다.' + (실패 ? '\n\n⚠ 실패건은 화면에서 직접 확인해 주세요.' : ''));
+  }
+
   /* ═════════ 오케스트레이터 ═════════ */
   // 현재 페이지 코드 긁기 (아래까지 스크롤)
   // [v24] 전체코드(전체set)와 '검수 필요' 코드(검수set)를 함께 수집. 페이지 순회는 전체set 증가 기준.
@@ -201,7 +335,7 @@
     if (!isList) { _알림('체험단 관리 "목록" 페이지에서 시작하세요.'); return; }
     const KEY = 키확보(); if (!KEY) return;
     const _버전 = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?';
-    if (!_확인('검수 대상 수집을 시작합니다. (스크립트 버전 v' + _버전 + ')\n\n"리뷰 검수" 버튼이 있는 캠페인만 모읍니다 — 이미 완료된 캠페인은 자동 제외됩니다.\n각 캠페인 안에서도 검수전 리뷰어만 판독합니다(검수완료는 건너뜀).\n\n계속할까요?')) return;
+    if (!_확인('검수 대상 수집을 시작합니다. (스크립트 버전 v' + _버전 + ')\n\n"리뷰 검수" 버튼이 있는 캠페인만 모읍니다(=검수전 리뷰가 남은 캠페인).\n이전에 검수했던 캠페인도 새 리뷰가 있으면 다시 들어가 검수전만 추가 검수합니다(검수완료는 건너뜀).\n\n계속할까요?')) return;
     수집쓰기({ active: true, codes: [], allcodes: [] });
     수집진행체크();   // 1페이지부터 시작
   }
@@ -212,6 +346,7 @@
     if (!isList) return;
     const cs = 수집읽기();
     if (!cs.active || 수집중플래그) return;
+    if (차단감지()) return;   // [v41] 차단 감지 시 수집 중단
     수집중플래그 = true;
     try {
       const 시작버튼 = document.getElementById('__시작버튼');
@@ -225,8 +360,8 @@
       const 페이지 = URL페이지();
       수집쓰기(cs);
       if (시작버튼) 시작버튼.textContent = '▶ 수집 중… ' + 페이지 + '페이지 (검수필요 ' + cs.codes.length + ' / 전체 ' + cs.allcodes.length + ')';
-      if (added > 0 || 페이지 === 1) {   // 새 코드가 있으면 다음 페이지로
-        await sleep(600); 페이지이동(페이지 + 1); return;
+      if ((added > 0 || 페이지 === 1) && 페이지 < 50) {   // [v41] 새 코드가 있으면 다음 페이지로 (최대 50p 안전상한 · 간격 상향)
+        await sleep(2500); 페이지이동(페이지 + 1); return;
       }
       // 새 코드 0 → 마지막 페이지 지남 → 수집 완료. 검수필요 있으면 그것만, 없으면 전체로 폴백(항상 실행).
       cs.active = false; 수집쓰기(cs);
@@ -241,20 +376,44 @@
     if (!codes.length) { _알림('캠페인을 하나도 못 찾았습니다.\n체험단 관리 "목록" 페이지에서 실행했는지 확인하세요.\n(F12 콘솔에 수집 로그가 찍힙니다.)'); return; }
     const done = 누적읽기();
     const 전체 = codes.length;
-    let 남은 = codes.filter(c => !done[c]);
-    const 완료수 = 전체 - 남은.length;
-    if (!남은.length) { _알림('수집된 ' + 전체 + '개 캠페인이 모두 이미 처리됐습니다.\n처음부터 다시 하려면 🗑 누적 초기화 후 시작하세요.'); return; }
+    // [v40.2] '리뷰 검수' 버튼으로 수집된 = 아직 검수전 리뷰가 남아 있는 캠페인. 이미 누적에 있어도 새 리뷰가 추가됐을 수 있으므로 건너뛰지 말고 재진입한다.
+    //   (본체는 검수완료 리뷰를 자동으로 스킵하므로 중복 승인·반려 없음. 새 검수전만 처리.)
+    let 남은 = codes;
+    const 재검수수 = codes.filter(c => done[c]).length;   // 예전에 한 번 검수했던 캠페인 수(정보용)
+    if (!남은.length) { _알림('수집된 검수 대상 캠페인이 없습니다.\n체험단 관리 "목록"에서 실행했는지 확인하세요.'); return; }
     let queue = 남은.map(c => ({ code: c, id: c.slice(0, 16), url: location.origin + '/trials/client/campaigns/' + c.slice(0, 16) }));
     if (최대캠페인 > 0) queue = queue.slice(0, 최대캠페인);
-    if (!_확인('목록 수집 완료!\n\n전체 ' + 전체 + '개\n이미 완료 ' + 완료수 + '개 → 건너뜀\n이번에 진행 ' + queue.length + '개' + (최대캠페인 > 0 ? ' (제한 ' + 최대캠페인 + ')' : '') + '\n\n각 캠페인에 자동 진입해 검수합니다.\n계속할까요?')) return;
+    if (!_확인('목록 수집 완료!\n\n검수 대상 ' + 전체 + '개 (새 검수전 리뷰가 있는 캠페인)\n  · 그중 이전에 검수했던 캠페인 ' + 재검수수 + '개 → 다시 들어가 새 리뷰만 추가 검수\n이번에 진행 ' + queue.length + '개' + (최대캠페인 > 0 ? ' (제한 ' + 최대캠페인 + ')' : '') + '\n\n각 캠페인에 자동 진입해 검수합니다.\n계속할까요?')) return;
     오케쓰기({ mode: 'running', queue, idx: 0 });
     location.href = queue[0].url;
+  }
+
+  /* ═════════ [v41] 접근차단 감지 → 즉시 정지 ═════════ */
+  function 차단걸림(사유) {
+    if (차단됨) return true;
+    차단됨 = true;
+    try { const o = 오케읽기(); if (o.mode === 'running') { o.mode = 'paused'; 오케쓰기(o); } } catch (e) {}
+    try { 수집쓰기({ active: false, codes: [], allcodes: [] }); } catch (e) {}
+    try { 버튼갱신(); } catch (e) {}
+    try { console.error('⛔ [차단감지] 자동화 정지: ' + 사유); } catch (e) {}
+    try { _알림('⛔ 스타일씨 접근 차단이 감지되어 자동화를 즉시 중단했습니다.\n\n사유: ' + 사유 + '\n\n같은 IP로 계속 시도하면 영구 차단될 수 있습니다.\n핫스팟/공유기로 IP를 바꾼 뒤 다시 시작하세요.'); } catch (e) {}
+    return true;
+  }
+  function 차단감지() {
+    try {
+      if (차단됨) return true;
+      const t = (document.body && document.body.innerText || '').slice(0, 4000);
+      if (차단문구.test(t)) return 차단걸림('페이지 문구: ' + ((t.match(차단문구) || [''])[0]));
+      if (_사이트마지막알림 && (Date.now() - _사이트마지막알림.t < 60000) && 차단문구.test(_사이트마지막알림.m)) return 차단걸림('사이트 알림');
+    } catch (e) {}
+    return false;
   }
 
   let 진행중 = false;
   async function 자동진행체크() {
     const o = 오케읽기();
     if (o.mode !== 'running' || !isDetail || 진행중) return;
+    if (차단감지()) return;   // [v41] 차단 감지 시 진행 중단
     진행중 = true;
     await sleep(3500);          // 페이지 렌더 대기
     try {
@@ -272,14 +431,14 @@
       if (status === '__TIMEOUT__') { 문제추가(현재코드, '15분 초과 → 건너뜀'); console.log('⏭ 시간초과 건너뜀: ' + 현재코드); }
       // 다음으로
       cur.idx += 1; 오케쓰기(cur); 버튼갱신();
-      if (cur.idx < cur.queue.length) { await sleep(1500); location.href = cur.queue[cur.idx].url; }
+      if (cur.idx < cur.queue.length) { if (차단감지()) return; await sleep(4000); location.href = cur.queue[cur.idx].url; }
       else { cur.mode = 'done'; 오케쓰기(cur); await sleep(500); 전체내보내기(); _알림('🎉 전체 자동검수 완료!\n\n총 ' + cur.queue.length + '개 캠페인 처리, 통합 파일이 다운로드됐습니다.'); }
     } catch (e) {
       console.error(e);
       const cur = 오케읽기();
       문제추가((cur.queue[cur.idx] || {}).code, '오류: ' + String(e && e.message).slice(0, 80));   // [v13] 오류도 기록 후 계속
       cur.idx += 1; 오케쓰기(cur);
-      if (cur.idx < cur.queue.length) { await sleep(1500); location.href = cur.queue[cur.idx].url; }
+      if (cur.idx < cur.queue.length) { if (차단감지()) return; await sleep(4000); location.href = cur.queue[cur.idx].url; }
       else { cur.mode = 'done'; 오케쓰기(cur); 전체내보내기(); }
     } finally { 진행중 = false; }
   }
@@ -464,11 +623,11 @@
       return { 사유, 결제, 판정 };
     };
     const cnt = {}; D.forEach(d => { if (d.주문번호) cnt[d.주문번호] = (cnt[d.주문번호] || 0) + 1; });
-    // [v36] 크로스 캠페인 주문번호 원장 — 이전에 처리한 '다른 캠페인'의 참여자가 쓴 주문번호를 재사용하면 중복 당첨 정산 위반(각 캠페인은 고유 주문번호 필요)
-    const 원장 = {};
-    try { const _acc = 누적읽기(); Object.keys(_acc).forEach(ck => { if (ck === 캠) return; (_acc[ck].행 || []).forEach(r => { [숫자만(r[6]), 숫자만(r[7])].forEach(on => { if (on && on.length >= 8) (원장[on] = 원장[on] || new Set()).add((String(ck).match(/A\d{6}/) || [ck])[0] + '·' + r[1]); }); }); }); } catch (e) {}
-    const 원장조회 = d => { const c = [숫자만(d.주문번호)]; if (d.판독 && d.판독.영수증주문번호) c.push(숫자만(d.판독.영수증주문번호)); for (const on of c) { if (on && on.length >= 8 && 원장[on] && 원장[on].size) return [...원장[on]][0]; } return ''; };
-    D.forEach(d => { if (d.상태 === '검수완료') { d.판정 = '검수완료'; return; } d.중복 = cnt[d.주문번호] > 1; d.크로스중복 = 원장조회(d); Object.assign(d, 판정하기(d, d.판독)); if (d.결제 != null && d.결제 < 정가) { d.할인 = 정가 - d.결제; d.목표 = 기준페이백 - d.할인; } });
+    // [v40] 크로스 캠페인 돌려쓰기 탐지 — 영구 원장(독립 저장) 기준. 다른 캠페인에 이미 등록된 주문번호를 재사용하면 반려.
+    //   v39는 누적(juksu_accum)에서 원장을 매번 새로 만들어 누적 초기화 시 소실됐음. v40은 영구 원장을 조회.
+    D.forEach(d => { if (d.상태 === '검수완료') { d.판정 = '검수완료'; return; } d.중복 = cnt[d.주문번호] > 1; d.크로스중복 = 원장크로스조회(d, 캠); Object.assign(d, 판정하기(d, d.판독)); if (d.결제 != null && d.결제 < 정가) { d.할인 = 정가 - d.결제; d.목표 = 기준페이백 - d.할인; } });
+    // [v40] 판정 후 이 캠페인의 검수전 건 주문번호를 영구 원장에 등록(최초 등록 우선). 다음 캠페인에서 재사용 시 돌려쓰기로 잡힘.
+    D.forEach(d => { if (d.상태 === '검수전' && d.주문번호) 원장등록(d, 캠, 스탬프); });
 
     const 검증대상 = D.filter(d => ['승인대상', '반려', '조정필요', '조정완료'].includes(d.판정) && d.증빙.length);
     console.log('■ 2차 교차검증 ' + 검증대상.length + '건');

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         체험단 선정 자동화 (메종원스이어)
 // @namespace    maison-once-a-year
-// @version      2.2
-// @description  스타일씨 당첨자 선정 통합 + 담당자용 내보내기. v2.2: 중복팝업 '시간/분 전' 당첨도 0일로 인식(판독불가 스킵 해소). 1개월내 3회미만 선정.
+// @version      2.4
+// @description  [v2.4] IP차단 방지 안전판 — 접근차단/에러 감지 시 자동 즉시중단, 화면전환 간격 상향. v2.3 사이드바 「당첨자 선정」 자동 이동 + v2.2 중복팝업 판정 유지.
 // @match        https://stylec.co.kr/*
 // @match        https://*.stylec.co.kr/*
 // @grant        none
@@ -40,6 +40,23 @@
   const 대기 = async (fn, n = 24, ms = 500) => { for (let i = 0; i < n; i++) { const r = fn(); if (r) return r; await sleep(ms); } return null; };
   const 오늘 = () => new Date().toISOString().slice(0, 10);
   const 오늘0 = () => { const n = new Date(); n.setHours(0, 0, 0, 0); return n; };
+
+  /* ═════════ [v2.4] 접근차단 감지 → 즉시 정지 ═════════ */
+  const 차단문구 = /(접근\s*불가|비정상적?인?\s*접근|접근이?\s*(제한|차단)됨?|일시적으로\s*(제한|차단)|too\s*many\s*requests|forbidden|\b403\b|\b429\b|\b503\b)/i;
+  let 차단됨 = false;
+  const 차단감지 = () => {
+    if (차단됨) return true;
+    try {
+      const t = (document.body && document.body.innerText || '').slice(0, 4000);
+      if (차단문구.test(t)) {
+        차단됨 = true; try { S.모드 = 'idle'; 쓰기(S); } catch (e) {}
+        console.error('⛔ [선정] 접근 차단 감지 → 자동화 중단');
+        try { alert('⛔ 스타일씨 접근 차단이 감지되어 선정 자동화를 중단했습니다.\n\n같은 IP로 계속하면 영구 차단될 수 있습니다.\n핫스팟/공유기로 IP를 바꾼 뒤 다시 시작하세요.'); } catch (e) {}
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  };
 
   const 저장 = (이름, 내용) => {
     try {
@@ -161,7 +178,7 @@
     $('dry').onclick = () => { 설정읽기(); 한번(false, true); };
     두번클릭($('run'), '실제 선정을 시작합니다. 되돌릴 수 없습니다 — 4초 안에 「한번 더 ▶」를 누르세요.', () => {
       설정읽기();
-      S.모드 = 'run'; S.완료 = []; S.결과 = []; S.로그 = []; S._대기 = 0; S.시작 = new Date().toLocaleString('ko-KR');
+      S.모드 = 'run'; S.완료 = []; S.결과 = []; S.로그 = []; S._대기 = 0; S._자동이동 = 0; S.시작 = new Date().toLocaleString('ko-KR');
       쓰기(S); 기록('▶ 실행 시작 — ' + S.시작 + ' (이후 자동 진행)'); 틱();
     }, '#1f6f66');
     $('stop').onclick = () => { S.모드 = 'idle'; 쓰기(S); 진행중 = false; 기록('■ 중지했습니다.'); 상태갱신(); };
@@ -377,12 +394,13 @@
   const 순회 = async () => {
     상태갱신();
     if (S.모드 !== 'run') return;
+    if (차단감지()) return;   // [v2.4] 접근 차단 감지 시 즉시 중단
     const 코드하나 = () => (document.body.innerText.match(/\d{16}A\d{6}/) || [])[0] || '';
     const 다음화면으로 = async () => {
       const 메뉴 = 포함찾기(/^당첨자\s*선정$/) || 포함찾기(/^체험단\s*관리$/);
       if (메뉴) 메뉴.click(); else { history.back(); await sleep(600); history.back(); }
       await 대기(() => ((목록임() || (document.body.innerText.match(/\d{16}A\d{6}/g) || []).length >= 2) ? true : null), 30, 500);
-      await sleep(1200);
+      await sleep(2500);   // [v2.4] 화면전환 간격 상향
     };
 
     // A) 지원자(선택하기) 화면
@@ -406,7 +424,7 @@
       액션.click();
       const ok = await 대기(() => (상세임() ? true : null), 30, 500);
       if (!ok) { 기록('  ⏳ 지원자 화면 로딩 대기 — 자동 재시도'); return; }
-      await sleep(900); return 순회();
+      await sleep(2000); return 순회();   // [v2.4] 간격 상향
     }
 
     // C) 당첨자 선정 목록 (선정하기 버튼)
@@ -421,7 +439,7 @@
       btn.버튼.click();
       const 들어감 = await 대기(() => (상세임() ? true : null), 24, 500);
       if (!들어감) { 기록('  ⏳ 지원자 화면 대기 — 자동 재시도'); return; }
-      await sleep(1000); return 순회();
+      await sleep(2000); return 순회();   // [v2.4] 간격 상향
     }
 
     // D) 캠페인 관리 목록 (수정+삭제 있을 때만) — 과거순 쿠키 상세 진입
@@ -441,8 +459,23 @@
       enter.click();
       const 왔나 = await 대기(() => ((선정액션버튼() || 상세임()) ? true : null), 30, 500);
       if (!왔나) { 기록('  ⏳ 상세 진입 대기 — 자동 재시도'); return; }
-      await sleep(800); return 순회();
+      await sleep(2000); return 순회();   // [v2.4] 간격 상향
     }
+
+    // E-0) [v2.3] 선정 화면이 아니면(예: 체험단 관리/검수 목록에서 실행) 사이드바 「당첨자 선정」을 자동 클릭해 올바른 화면으로 이동
+    if (!목록임() && !상세임() && !선정액션버튼() && !관리목록임()) {
+      const 선정메뉴 = 포함찾기(/^당첨자\s*선정$/);
+      if (선정메뉴) {
+        S._자동이동 = (S._자동이동 || 0) + 1; 쓰기(S);
+        if (S._자동이동 <= 6) {
+          기록('  ↪ 선정 화면이 아님 → 사이드바 「당첨자 선정」 클릭해 이동 (' + S._자동이동 + ')');
+          try { 선정메뉴.click(); } catch (e) {}
+          await 대기(() => (목록임() ? true : null), 24, 500);
+          await sleep(900);
+          return 순회();
+        }
+      }
+    } else { S._자동이동 = 0; }
 
     // E) 알 수 없는/로딩 중 — 끝내지 말고 대기 후 재시도
     S._대기 = (S._대기 || 0) + 1; 쓰기(S);
